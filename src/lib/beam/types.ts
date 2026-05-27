@@ -15,13 +15,11 @@ export type BeamNode = {
   status: BeamNodeStatus;
 };
 
-export type BeamRequest = {
+export type NextTokenRequest = {
   provider: ProviderId;
   model: string;
   text: string;
   topK?: number;
-  depth: number;
-  nodeBudget?: number;
 };
 
 export type BeamResponse = {
@@ -30,39 +28,14 @@ export type BeamResponse = {
   providerStatus?: string;
 };
 
+export type NextTokenResponse = {
+  alternatives: BeamTokenAlternative[];
+};
+
 export type BeamTokenAlternative = TokenAlternative & {
   rank: number;
   prob: number;
 };
-
-export type BeamEvent =
-  | {
-      type: 'reset';
-      rootId: string;
-      node: BeamNode;
-    }
-  | {
-      type: 'alternatives';
-      parentId: string;
-      alternatives: BeamTokenAlternative[];
-    }
-  | {
-      type: 'parent';
-      node: BeamNode;
-    }
-  | {
-      type: 'node';
-      node: BeamNode;
-    }
-  | {
-      type: 'node-error';
-      node: BeamNode;
-      message: string;
-    }
-  | {
-      type: 'done';
-      providerStatus?: string;
-    };
 
 export type ModelOption = {
   provider: ProviderId;

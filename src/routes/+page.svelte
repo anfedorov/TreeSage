@@ -1,12 +1,12 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import type {
-    BeamEvent,
     BeamNode,
     BeamResponse,
     BeamTokenAlternative,
     ModelsResponse,
     ModelOption,
+    NextTokenResponse,
     ProviderId
   } from '$lib/beam/types';
 
@@ -16,12 +16,10 @@
   let detailMode = $state<DetailMode>('detailed');
   let visibleDepth = $state(12);
   let generatedDepth = $state(20);
-  let nodeBudget = $state(80);
   let selectedProvider = $state<ProviderId>('fake');
   let selectedModel = $state('fake-sage-small');
   let models = $state<ModelOption[]>([]);
   let beam = $state<BeamResponse | null>(null);
-  let pendingBeam = $state<BeamResponse | null>(null);
   let loadingModels = $state(true);
   let statusMessage = $state('');
   let hoveredNodeId = $state<string | null>(null);
@@ -36,10 +34,13 @@
   let renderPruneTimer: ReturnType<typeof setTimeout> | undefined;
   let alternativePopoverShowTimer: ReturnType<typeof setTimeout> | undefined;
   let alternativePopoverHideTimer: ReturnType<typeof setTimeout> | undefined;
-  let beamStream: EventSource | undefined;
+  let explorationController: AbortController | undefined;
+  let explorationRunning = false;
+  let explorationQueued = false;
   let fittingDepth = false;
 
-  const maxNodeBudget = 720;
+  const modelTopK = 20;
+  const maxClientNodes = 2000;
   const alternativePopoverPadding = 8;
   const nextTokenGap = 8;
   const minimumVisibleNextTokenWidth = 1;
@@ -76,136 +77,69 @@
     }
   }
 
-  function upsertNode(response: BeamResponse | null, node: BeamNode): BeamResponse | null {
-    if (!response) return response;
+  function probability(logprob: number): number {
+    if (!Number.isFinite(logprob)) return 0;
+    return Math.exp(logprob);
+  }
 
-    const existingIndex = response.nodes.findIndex((existing) => existing.id === node.id);
-    const nodes = [...response.nodes];
-    if (existingIndex >= 0) {
-      nodes[existingIndex] = node;
-    } else {
-      nodes.push(node);
-    }
+  function nodeId(parentId: string, depth: number, rank: number, token: string): string {
+    const encoded =
+      Array.from(token)
+        .map((char) => char.charCodeAt(0).toString(36))
+        .join('')
+        .slice(0, 16) || 'empty';
+    return `${parentId}-${depth}-${rank}-${encoded}`;
+  }
 
+  function createRootNode(rootText: string): BeamNode {
     return {
-      ...response,
-      nodes
+      id: 'root',
+      parentId: null,
+      depth: 0,
+      text: rootText,
+      rank: 0,
+      logprob: 0,
+      prob: 1,
+      cumulativeLogprob: 0,
+      children: [],
+      status: 'leaf'
     };
   }
 
-  function promotePendingBeamIfReady() {
-    if (!pendingBeam || !beam) return false;
-    if (pendingBeam.nodes.length < beam.nodes.length) return false;
-
-    beam = pendingBeam;
-    pendingBeam = null;
-    return true;
+  function createChildNode(parent: BeamNode, alternative: BeamTokenAlternative): BeamNode {
+    return {
+      id: nodeId(parent.id, parent.depth + 1, alternative.rank, alternative.text),
+      parentId: parent.id,
+      depth: parent.depth + 1,
+      text: alternative.text,
+      rank: alternative.rank,
+      logprob: alternative.logprob,
+      prob: alternative.prob ?? probability(alternative.logprob),
+      cumulativeLogprob: parent.cumulativeLogprob + alternative.logprob,
+      children: [],
+      status: 'leaf'
+    };
   }
 
-  function beamStreamUrl(): string {
-    const params = new URLSearchParams({
-      provider: selectedProvider,
-      model: selectedModel,
-      text,
-      depth: String(generatedDepth),
-      nodeBudget: String(nodeBudget)
-    });
-
-    return `/api/beam/stream?${params.toString()}`;
-  }
-
-  function handleBeamEvent(event: BeamEvent, preserveCurrent: boolean) {
-    if (event.type === 'reset') {
-      alternativesByParentId = new Map();
-      renderTerminalNodeIds = new Set();
-      const nextBeam = {
-        rootId: event.rootId,
-        nodes: [event.node]
-      };
-      if (preserveCurrent) {
-        pendingBeam = nextBeam;
-      } else {
-        beam = nextBeam;
-      }
-      statusMessage = '';
-      return;
-    }
-
-    if (event.type === 'alternatives') {
-      alternativesByParentId = new Map(alternativesByParentId).set(
-        event.parentId,
-        event.alternatives
-      );
-      return;
-    }
-
-    if (event.type === 'parent' || event.type === 'node') {
-      if (preserveCurrent && pendingBeam) {
-        pendingBeam = upsertNode(pendingBeam, event.node);
-        promotePendingBeamIfReady();
-      } else {
-        beam = upsertNode(beam, event.node);
-      }
-      void fitDepthToRightEdge(false);
-      scheduleRenderPrune();
-      return;
-    }
-
-    if (event.type === 'node-error') {
-      if (preserveCurrent && pendingBeam) {
-        pendingBeam = upsertNode(pendingBeam, event.node);
-        promotePendingBeamIfReady();
-      } else {
-        beam = upsertNode(beam, event.node);
-      }
-      statusMessage = event.message;
-      scheduleRenderPrune();
-      return;
-    }
-
-    if (event.type === 'done') {
-      statusMessage = event.providerStatus ?? '';
-      if (preserveCurrent && pendingBeam) {
-        beam = pendingBeam;
-        pendingBeam = null;
-      }
-      beamStream?.close();
-      beamStream = undefined;
-      void fitDepthToRightEdge(true);
-      scheduleRenderPrune();
-    }
-  }
-
-  function loadBeam(preserveCurrent = false) {
-    beamStream?.close();
-    pendingBeam = null;
-    if (!preserveCurrent) beam = null;
+  function loadBeam() {
+    explorationController?.abort();
+    const root = createRootNode(text);
+    beam = {
+      rootId: root.id,
+      nodes: [root]
+    };
+    alternativesByParentId = new Map();
+    renderTerminalNodeIds = new Set();
     statusMessage = '';
 
-    const stream = new EventSource(beamStreamUrl());
-    beamStream = stream;
-
-    stream.onmessage = (message) => {
-      handleBeamEvent(JSON.parse(message.data) as BeamEvent, preserveCurrent);
-    };
-
-    for (const type of ['reset', 'alternatives', 'parent', 'node', 'node-error', 'done']) {
-      stream.addEventListener(type, (message) => {
-        handleBeamEvent(JSON.parse(message.data) as BeamEvent, preserveCurrent);
-      });
-    }
-
-    stream.onerror = () => {
-      statusMessage = 'Beam stream disconnected.';
-      stream.close();
-      if (beamStream === stream) beamStream = undefined;
-    };
+    explorationController = new AbortController();
+    void continueExploration(explorationController.signal);
   }
 
-  function scheduleBeamRefresh(delay = 250, preserveCurrent = false) {
+  function scheduleBeamRefresh(delay = 250) {
     if (refreshTimer) clearTimeout(refreshTimer);
     refreshTimer = setTimeout(() => {
-      loadBeam(preserveCurrent);
+      loadBeam();
     }, delay);
   }
 
@@ -214,6 +148,237 @@
     selectedProvider = provider;
     selectedModel = model;
     scheduleBeamRefresh(0);
+  }
+
+  async function getAlternatives(parent: BeamNode, signal: AbortSignal): Promise<BeamTokenAlternative[]> {
+    const cached = alternativesByParentId.get(parent.id);
+    if (cached) return cached;
+
+    const response = await fetch('/api/next-token', {
+      method: 'POST',
+      signal,
+      headers: {
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        provider: selectedProvider,
+        model: selectedModel,
+        text: pathPrefix(parent),
+        topK: modelTopK
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`Next-token request failed with ${response.status}`);
+    }
+
+    const payload = (await response.json()) as NextTokenResponse;
+    alternativesByParentId = new Map(alternativesByParentId).set(parent.id, payload.alternatives);
+    return payload.alternatives;
+  }
+
+  function pathPrefix(node: BeamNode): string {
+    if (!node.parentId) return node.text;
+    return `${text}${pathText(node)}`;
+  }
+
+  function addChild(parent: BeamNode, alternative: BeamTokenAlternative): BeamNode | undefined {
+    if (!beam) return undefined;
+    const freshParent = nodesById.get(parent.id);
+    if (!freshParent) return undefined;
+
+    const existingChild = freshParent.children
+      .map((childId) => nodesById.get(childId))
+      .find((child) => child?.rank === alternative.rank);
+    if (existingChild) return existingChild;
+
+    const child = createChildNode(freshParent, alternative);
+    const parentChildren = [...freshParent.children, child.id].sort((leftId, rightId) => {
+      const left = leftId === child.id ? child : nodesById.get(leftId);
+      const right = rightId === child.id ? child : nodesById.get(rightId);
+      return (left?.rank ?? 0) - (right?.rank ?? 0);
+    });
+    const updatedParent: BeamNode = {
+      ...freshParent,
+      children: parentChildren,
+      status: 'expanded'
+    };
+
+    const nextNodes = beam.nodes.map((node) => (node.id === updatedParent.id ? updatedParent : node));
+    nextNodes.push(child);
+    beam = {
+      ...beam,
+      nodes: nextNodes
+    };
+    scheduleRenderPrune();
+    return child;
+  }
+
+  function nextHiddenAlternative(parent: BeamNode): BeamTokenAlternative | undefined {
+    const alternatives = alternativesByParentId.get(parent.id);
+    if (!alternatives) return undefined;
+
+    const childRanks = new Set(
+      parent.children
+        .map((childId) => nodesById.get(childId)?.rank)
+        .filter((rank): rank is number => typeof rank === 'number')
+    );
+    return alternatives.find((alternative) => !childRanks.has(alternative.rank));
+  }
+
+  function visibleChildProbSum(parent: BeamNode): number {
+    return parent.children.reduce((sum, childId) => sum + (nodesById.get(childId)?.prob ?? 0), 0);
+  }
+
+  function hiddenMass(parent: BeamNode): number {
+    return Math.max(0, 1 - visibleChildProbSum(parent));
+  }
+
+  async function continueExploration(signal = explorationController?.signal) {
+    if (!signal || signal.aborted) return;
+    if (explorationRunning) {
+      explorationQueued = true;
+      return;
+    }
+
+    explorationRunning = true;
+    try {
+      do {
+        explorationQueued = false;
+        await exploreUntilFull(signal);
+      } while (explorationQueued && !signal.aborted);
+    } finally {
+      explorationRunning = false;
+    }
+  }
+
+  async function exploreUntilFull(signal: AbortSignal) {
+    if (!rootNode) return;
+
+    try {
+      await extendGreedyPath(rootNode, signal);
+
+      while (!signal.aborted && currentNodes.length < maxClientNodes) {
+        await updateRenderTerminals();
+        const parent = parentWithMostHiddenMass();
+        if (!parent) break;
+
+        const next = nextHiddenAlternative(parent);
+        if (!next) break;
+
+        const child = addChild(parent, next);
+        if (!child) break;
+        await tick();
+        await extendGreedyPath(child, signal);
+      }
+    } catch (error) {
+      if (!signal.aborted) {
+        statusMessage = error instanceof Error ? error.message : 'Tree exploration failed.';
+      }
+    }
+  }
+
+  async function extendGreedyPath(start: BeamNode, signal: AbortSignal) {
+    let cursor: BeamNode | undefined = start;
+
+    while (cursor && !signal.aborted && cursor.depth < generatedDepth && currentNodes.length < maxClientNodes) {
+      await updateRenderTerminals();
+      if (cursor.parentId && !nodeHasRoomForChild(cursor)) return;
+
+      const alternatives = await getAlternatives(cursor, signal);
+      if (signal.aborted || alternatives.length === 0) return;
+
+      const topAlternative = alternatives[0];
+      const child = addChild(cursor, topAlternative);
+      if (!child || child.id === cursor.id) return;
+
+      await tick();
+      cursor = child;
+    }
+  }
+
+  function parentWithMostHiddenMass(): BeamNode | undefined {
+    const canAddRow = hasRoomForAnotherRenderedRow();
+    const candidates = visibleTokenNodes()
+      .filter((node) => node.depth < generatedDepth && nodeHasRoomForChild(node));
+
+    let best: BeamNode | undefined;
+    let bestHiddenMass = -Infinity;
+
+    for (const candidate of candidates) {
+      if (!alternativesByParentId.has(candidate.id)) {
+        if (candidate.children.length === 0) return candidate;
+        continue;
+      }
+
+      if (candidate.children.length > 0 && !canAddRow) continue;
+      if (!nextHiddenAlternative(candidate)) continue;
+      const candidateHiddenMass = hiddenMass(candidate);
+      if (candidateHiddenMass > bestHiddenMass) {
+        best = candidate;
+        bestHiddenMass = candidateHiddenMass;
+      }
+    }
+
+    return best;
+  }
+
+  function hasRoomForAnotherRenderedRow(): boolean {
+    if (!treeFrameElement) return true;
+
+    const frameRect = treeFrameElement.getBoundingClientRect();
+    const frameStyle = getComputedStyle(treeFrameElement);
+    const verticalSpace =
+      frameRect.height -
+      (Number.parseFloat(frameStyle.paddingTop) || 0) -
+      (Number.parseFloat(frameStyle.paddingBottom) || 0);
+    const maxRows = Math.max(1, Math.floor(verticalSpace / treeRowPitch));
+    const renderedRows = new Set(
+      Array.from(treeFrameElement.querySelectorAll<HTMLElement>('.token-button')).map((element) =>
+        Math.round(element.getBoundingClientRect().top)
+      )
+    );
+
+    return renderedRows.size < maxRows;
+  }
+
+  function visibleTokenNodes(): BeamNode[] {
+    if (!treeFrameElement) return rootNode ? [rootNode] : [];
+
+    const frameRect = treeFrameElement.getBoundingClientRect();
+    const frameStyle = getComputedStyle(treeFrameElement);
+    const bottomEdge = frameRect.bottom - (Number.parseFloat(frameStyle.paddingBottom) || 0);
+    const nodes: BeamNode[] = [];
+
+    if (rootNode && rootNode.children.length === 0) nodes.push(rootNode);
+
+    for (const element of treeFrameElement.querySelectorAll<HTMLElement>('.token-button')) {
+      const nodeId = element.dataset.nodeId;
+      const node = nodeId ? nodesById.get(nodeId) : undefined;
+      if (!node) continue;
+
+      const rect = element.getBoundingClientRect();
+      if (rect.bottom <= bottomEdge + 1 && rect.top >= frameRect.top) {
+        nodes.push(node);
+      }
+    }
+
+    return nodes;
+  }
+
+  function nodeHasRoomForChild(node: BeamNode): boolean {
+    if (!treeFrameElement || !node.parentId) return true;
+
+    const selector = `[data-node-id="${CSS.escape(node.id)}"]`;
+    const element = treeFrameElement.querySelector<HTMLElement>(selector);
+    if (!element) return false;
+
+    const frameRect = treeFrameElement.getBoundingClientRect();
+    const frameStyle = getComputedStyle(treeFrameElement);
+    const rightEdge = frameRect.right - (Number.parseFloat(frameStyle.borderRightWidth) || 0);
+    const bottomEdge = frameRect.bottom - (Number.parseFloat(frameStyle.paddingBottom) || 0);
+    const rect = element.getBoundingClientRect();
+    return rect.bottom <= bottomEdge + 1 && rect.right + nextTokenGap + minimumVisibleNextTokenWidth <= rightEdge;
   }
 
   function pathToNode(nodeId: string): BeamNode[] {
@@ -342,20 +507,17 @@
 
   function updateVisibleBeamShape() {
     const width = treeFrameElement?.clientWidth ?? 900;
-    const height = treeFrameElement?.clientHeight ?? 420;
     const nextDepth = Math.max(1, Math.min(48, Math.floor((width - 120) / 54)));
     const nextGeneratedDepth = generatedDepthForVisibleDepth(nextDepth);
-    const nextNodeBudget = nodeBudgetForDepth(nextGeneratedDepth, height);
-    const needsRefresh = nextGeneratedDepth > generatedDepth || nextNodeBudget > nodeBudget;
+    const needsMoreDepth = nextGeneratedDepth > generatedDepth;
 
-    if (nextDepth === visibleDepth && !needsRefresh) return false;
+    if (nextDepth === visibleDepth && !needsMoreDepth) return false;
 
     visibleDepth = nextDepth;
-    if (needsRefresh) {
+    if (needsMoreDepth) {
       generatedDepth = nextGeneratedDepth;
-      nodeBudget = nextNodeBudget;
     }
-    return needsRefresh;
+    return needsMoreDepth;
   }
 
   function scheduleRenderPrune() {
@@ -403,11 +565,6 @@
     return true;
   }
 
-  function nodeBudgetForDepth(depth: number, height = treeFrameElement?.clientHeight ?? 420) {
-    const visibleRows = Math.max(2, Math.ceil((height - 20) / 48) + 1);
-    return Math.max(2, Math.min(maxNodeBudget, 1 + depth * visibleRows));
-  }
-
   function generatedDepthForVisibleDepth(depth: number) {
     return Math.min(48, depth + 8);
   }
@@ -441,9 +598,7 @@
       const frameRect = treeFrameElement.getBoundingClientRect();
       const frameStyle = getComputedStyle(treeFrameElement);
       const rightBorder = Number.parseFloat(frameStyle.borderRightWidth) || 0;
-      const bottomPadding = Number.parseFloat(frameStyle.paddingBottom) || 0;
       const rightEdge = frameRect.right - rightBorder;
-      const bottomEdge = frameRect.bottom - bottomPadding;
       const topNodes = topRolloutNodes();
 
       const firstOverflowIndex = topNodes.findIndex((node) => {
@@ -461,45 +616,16 @@
       }
 
       const nextGeneratedDepth = generatedDepthForVisibleDepth(nextDepth);
-      let nextNodeBudget = nodeBudgetForDepth(nextGeneratedDepth);
+      const needsMoreDepth = nextGeneratedDepth > generatedDepth;
 
-      if (allowGrow) {
-        const tokenElements = Array.from(treeFrameElement.querySelectorAll<HTMLElement>('.token-button'));
-        const hasBottomOverflow = tokenElements.some(
-          (element) => element.getBoundingClientRect().bottom > bottomEdge + 1
-        );
-        const lowestBottom = tokenElements.reduce(
-          (bottom, element) => Math.max(bottom, element.getBoundingClientRect().bottom),
-          frameRect.top
-        );
-        const hasVerticalRoom = !hasBottomOverflow && lowestBottom < bottomEdge - 20;
-        const hasVisibleLeafWithHorizontalRoom = tokenElements.some((element) => {
-          const nodeId = element.dataset.nodeId;
-          const node = nodeId ? nodesById.get(nodeId) : undefined;
-          if (!node || node.children.length > 0 || node.depth >= generatedDepth) return false;
-
-          const rect = element.getBoundingClientRect();
-          const isVisible = rect.top >= frameRect.top && rect.bottom <= bottomEdge + 1;
-          return isVisible && rect.right + nextTokenGap + minimumVisibleNextTokenWidth <= rightEdge;
-        });
-
-        if ((hasVerticalRoom || hasVisibleLeafWithHorizontalRoom) && currentNodes.length >= nodeBudget) {
-          nextNodeBudget = Math.min(maxNodeBudget, Math.max(nextNodeBudget, nodeBudget + 48));
-        }
-      }
-
-      const needsRefresh = nextGeneratedDepth > generatedDepth || nextNodeBudget > nodeBudget;
-
-      if (nextDepth !== visibleDepth || needsRefresh) {
+      if (nextDepth !== visibleDepth || needsMoreDepth) {
         visibleDepth = nextDepth;
-        if (needsRefresh) {
+        if (needsMoreDepth) {
           generatedDepth = nextGeneratedDepth;
-          nodeBudget = nextNodeBudget;
-          beamStream?.close();
-          beamStream = undefined;
-          scheduleBeamRefresh(0, true);
         }
       }
+
+      if (allowGrow) void continueExploration();
     } finally {
       fittingDepth = false;
     }
@@ -534,8 +660,9 @@
 
     const handleResize = () => {
       renderTerminalNodeIds = new Set();
-      if (updateVisibleBeamShape()) scheduleBeamRefresh(0);
+      updateVisibleBeamShape();
       scheduleRenderPrune();
+      void continueExploration();
     };
     const handleKeydown = (event: KeyboardEvent) => {
       if (event.key.toLowerCase() !== 'd') return;
@@ -548,7 +675,7 @@
     window.addEventListener('keydown', handleKeydown);
 
     return () => {
-      beamStream?.close();
+      explorationController?.abort();
       if (renderPruneTimer) clearTimeout(renderPruneTimer);
       hideAlternativePopover();
       window.removeEventListener('resize', handleResize);
