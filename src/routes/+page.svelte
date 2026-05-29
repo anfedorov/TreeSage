@@ -10,10 +10,23 @@
     ProviderId
   } from '$lib/beam/types';
 
-  type DetailMode = 'clean' | 'detailed';
+  type EdgePath = {
+    id: string;
+    d: string;
+    parentId: string;
+    childId?: string;
+    highlightOnly?: boolean;
+  };
+
+  type TokenRect = {
+    left: number;
+    right: number;
+    centerY: number;
+    top: number;
+    bottom: number;
+  };
 
   let text = $state('The model');
-  let detailMode = $state<DetailMode>('detailed');
   let visibleDepth = $state(12);
   let generatedDepth = $state(20);
   let selectedProvider = $state<ProviderId>('fake');
@@ -26,12 +39,18 @@
   let alternativePopoverNodeId = $state<string | null>(null);
   let alternativePopoverX = $state(0);
   let alternativePopoverY = $state(0);
+  let hoveredAlternativeRank = $state<number | null>(null);
   let alternativesByParentId = $state(new Map<string, BeamTokenAlternative[]>());
   let debugScrollMode = $state(false);
   let renderTerminalNodeIds = $state(new Set<string>());
+  let edgePaths = $state<EdgePath[]>([]);
+  let edgeLayerWidth = $state(0);
+  let edgeLayerHeight = $state(0);
   let treeFrameElement = $state<HTMLElement>();
+  let beamListElement = $state<HTMLElement>();
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   let renderPruneTimer: ReturnType<typeof setTimeout> | undefined;
+  let edgeMeasureFrame: number | undefined;
   let alternativePopoverShowTimer: ReturnType<typeof setTimeout> | undefined;
   let alternativePopoverHideTimer: ReturnType<typeof setTimeout> | undefined;
   let explorationController: AbortController | undefined;
@@ -42,15 +61,29 @@
   const modelTopK = 20;
   const maxClientNodes = 2000;
   const alternativePopoverPadding = 8;
-  const nextTokenGap = 8;
+  const alternativePopoverBorder = 1;
+  const alternativePopoverRowPitch = 41;
+  const nextTokenGap = 4;
   const minimumVisibleNextTokenWidth = 1;
-  const treeRowPitch = 48;
+  const treeRowPitch = 41;
+  const maxGeneratedDepth = 96;
+  const edgeCornerRadius = 2;
 
   const availableModels = $derived(models.filter((model) => model.available));
   const currentNodes = $derived(beam?.nodes ?? []);
   const nodesById = $derived(new Map(currentNodes.map((node) => [node.id, node])));
   const rootNode = $derived(beam ? nodesById.get(beam.rootId) : undefined);
-  const highlightedNodeIds = $derived(new Set(hoveredNodeId ? pathToNode(hoveredNodeId).map((node) => node.id) : []));
+  const highlightedNodeIds = $derived(
+    new Set(
+      hoveredNodeId
+        ? pathToNode(hoveredNodeId).map((node) => node.id)
+        : alternativePopoverNodeId
+          ? pathToNode(alternativePopoverNodeId)
+              .slice(0, -1)
+              .map((node) => node.id)
+          : []
+    )
+  );
   const alternativePopoverNode = $derived(
     alternativePopoverNodeId ? nodesById.get(alternativePopoverNodeId) : undefined
   );
@@ -130,10 +163,12 @@
     };
     alternativesByParentId = new Map();
     renderTerminalNodeIds = new Set();
+    edgePaths = [];
     statusMessage = '';
 
     explorationController = new AbortController();
     void continueExploration(explorationController.signal);
+    scheduleEdgeMeasure();
   }
 
   function scheduleBeamRefresh(delay = 250) {
@@ -148,6 +183,12 @@
     selectedProvider = provider;
     selectedModel = model;
     scheduleBeamRefresh(0);
+  }
+
+  function toggleDebugMode() {
+    debugScrollMode = !debugScrollMode;
+    if (alternativePopoverHideTimer) clearTimeout(alternativePopoverHideTimer);
+    alternativePopoverHideTimer = undefined;
   }
 
   async function getAlternatives(parent: BeamNode, signal: AbortSignal): Promise<BeamTokenAlternative[]> {
@@ -211,6 +252,7 @@
       nodes: nextNodes
     };
     scheduleRenderPrune();
+    scheduleEdgeMeasure();
     return child;
   }
 
@@ -429,6 +471,7 @@
     alternativePopoverShowTimer = undefined;
     alternativePopoverHideTimer = undefined;
     alternativePopoverNodeId = null;
+    hoveredAlternativeRank = null;
   }
 
   function handleNodeHoverStart(node: BeamNode, event: MouseEvent) {
@@ -438,8 +481,8 @@
     alternativePopoverShowTimer = undefined;
     alternativePopoverHideTimer = undefined;
     alternativePopoverNodeId = null;
+    hoveredAlternativeRank = null;
 
-    if (detailMode !== 'detailed') return;
     if (!node.parentId) return;
 
     const alternatives = alternativesForNode(node);
@@ -451,7 +494,11 @@
       alternatives.findIndex((alternative) => alternative.rank === node.rank)
     );
     alternativePopoverX = rect.left - alternativePopoverPadding - 1;
-    alternativePopoverY = rect.top - alternativePopoverPadding - currentAlternativeIndex * treeRowPitch - 1;
+    alternativePopoverY =
+      rect.top -
+      alternativePopoverPadding -
+      alternativePopoverBorder -
+      currentAlternativeIndex * alternativePopoverRowPitch;
     alternativePopoverShowTimer = setTimeout(() => {
       alternativePopoverNodeId = node.id;
       alternativePopoverShowTimer = undefined;
@@ -476,9 +523,16 @@
   function keepAlternativePopover() {
     if (alternativePopoverHideTimer) clearTimeout(alternativePopoverHideTimer);
     alternativePopoverHideTimer = undefined;
+    hoveredNodeId = null;
+  }
+
+  function handleAlternativeHover(rank: number) {
+    keepAlternativePopover();
+    hoveredAlternativeRank = rank;
   }
 
   function handleAlternativePopoverLeave() {
+    hoveredAlternativeRank = null;
     scheduleAlternativePopoverHide();
   }
 
@@ -527,6 +581,173 @@
     }, 0);
   }
 
+  function scheduleEdgeMeasure() {
+    if (typeof requestAnimationFrame === 'undefined') return;
+    if (edgeMeasureFrame !== undefined) cancelAnimationFrame(edgeMeasureFrame);
+    edgeMeasureFrame = requestAnimationFrame(() => {
+      edgeMeasureFrame = undefined;
+      void updateEdgePaths();
+    });
+  }
+
+  function roundedHorizontalVerticalPath(startX: number, startY: number, cornerX: number, endY: number) {
+    const horizontalDirection = Math.sign(cornerX - startX) || 1;
+    const verticalDirection = Math.sign(endY - startY) || 1;
+    const radius = Math.min(
+      edgeCornerRadius,
+      Math.abs(cornerX - startX) / 2,
+      Math.abs(endY - startY) / 2
+    );
+
+    if (radius < 0.5) return `M ${startX} ${startY} H ${cornerX} V ${endY}`;
+
+    return [
+      `M ${startX} ${startY}`,
+      `H ${cornerX - horizontalDirection * radius}`,
+      `Q ${cornerX} ${startY} ${cornerX} ${startY + verticalDirection * radius}`,
+      `V ${endY}`
+    ].join(' ');
+  }
+
+  function roundedBranchArmPath(trunkX: number, parentY: number, childY: number, childLeft: number) {
+    const verticalDirection = Math.sign(childY - parentY) || 1;
+    const horizontalDirection = Math.sign(childLeft - trunkX) || 1;
+    const radius = Math.min(
+      edgeCornerRadius,
+      Math.abs(childY - parentY) / 2,
+      Math.abs(childLeft - trunkX) / 2
+    );
+
+    if (radius < 0.5) return `M ${trunkX} ${childY} H ${childLeft}`;
+
+    return [
+      `M ${trunkX} ${childY - verticalDirection * radius}`,
+      `Q ${trunkX} ${childY} ${trunkX + horizontalDirection * radius} ${childY}`,
+      `H ${childLeft}`
+    ].join(' ');
+  }
+
+  function roundedHorizontalVerticalHorizontalPath(
+    startX: number,
+    startY: number,
+    cornerX: number,
+    endY: number,
+    endX: number
+  ) {
+    const firstHorizontalDirection = Math.sign(cornerX - startX) || 1;
+    const verticalDirection = Math.sign(endY - startY) || 1;
+    const secondHorizontalDirection = Math.sign(endX - cornerX) || 1;
+    const radius = Math.min(
+      edgeCornerRadius,
+      Math.abs(cornerX - startX) / 2,
+      Math.abs(endY - startY) / 2,
+      Math.abs(endX - cornerX) / 2
+    );
+
+    if (radius < 0.5) {
+      return `M ${startX} ${startY} H ${cornerX} V ${endY} H ${endX}`;
+    }
+
+    return [
+      `M ${startX} ${startY}`,
+      `H ${cornerX - firstHorizontalDirection * radius}`,
+      `Q ${cornerX} ${startY} ${cornerX} ${startY + verticalDirection * radius}`,
+      `V ${endY - verticalDirection * radius}`,
+      `Q ${cornerX} ${endY} ${cornerX + secondHorizontalDirection * radius} ${endY}`,
+      `H ${endX}`
+    ].join(' ');
+  }
+
+  async function updateEdgePaths() {
+    if (!treeFrameElement || !beamListElement || !rootNode) {
+      edgePaths = [];
+      edgeLayerWidth = 0;
+      edgeLayerHeight = 0;
+      return;
+    }
+
+    await tick();
+
+    const frameRect = treeFrameElement.getBoundingClientRect();
+    const frameStyle = getComputedStyle(treeFrameElement);
+    const borderLeft = Number.parseFloat(frameStyle.borderLeftWidth) || 0;
+    const borderTop = Number.parseFloat(frameStyle.borderTopWidth) || 0;
+    const bottomEdge = frameRect.bottom - (Number.parseFloat(frameStyle.paddingBottom) || 0);
+    const scrollLeft = treeFrameElement.scrollLeft;
+    const scrollTop = treeFrameElement.scrollTop;
+    const rectsByNodeId = new Map<string, TokenRect>();
+
+    const toLayerX = (x: number) => x - frameRect.left - borderLeft + scrollLeft;
+    const toLayerY = (y: number) => y - frameRect.top - borderTop + scrollTop;
+
+    for (const element of treeFrameElement.querySelectorAll<HTMLElement>('.token-button')) {
+      const nodeId = element.dataset.nodeId;
+      if (!nodeId) continue;
+
+      const rect = element.getBoundingClientRect();
+      if (rect.bottom < frameRect.top || rect.top > bottomEdge + 1) continue;
+
+      rectsByNodeId.set(nodeId, {
+        left: toLayerX(rect.left),
+        right: toLayerX(rect.right),
+        centerY: toLayerY(rect.top + rect.height / 2),
+        top: toLayerY(rect.top),
+        bottom: toLayerY(rect.bottom)
+      });
+    }
+
+    const nextEdges: EdgePath[] = [];
+    for (const parent of currentNodes) {
+      const parentRect = rectsByNodeId.get(parent.id);
+      if (!parentRect) continue;
+
+      const children: Array<{ node: BeamNode; rect: TokenRect }> = [];
+      for (const child of childNodes(parent)) {
+        const rect = rectsByNodeId.get(child.id);
+        if (rect) children.push({ node: child, rect });
+      }
+      children.sort((left, right) => left.rect.centerY - right.rect.centerY);
+
+      if (children.length === 0) continue;
+
+      const firstChildLeft = Math.min(...children.map((child) => child.rect.left));
+      const trunkX = Math.min(firstChildLeft - 1, parentRect.right + Math.max(2, (firstChildLeft - parentRect.right) / 2));
+      const lastChild = children[children.length - 1];
+      const lastChildY = lastChild.rect.centerY;
+      nextEdges.push({
+        id: `${parent.id}:trunk`,
+        parentId: parent.id,
+        d: roundedHorizontalVerticalPath(parentRect.right, parentRect.centerY, trunkX, lastChildY)
+      });
+
+      for (const child of children) {
+        nextEdges.push({
+          id: `${parent.id}:${child.node.id}:arm`,
+          parentId: parent.id,
+          childId: child.node.id,
+          d: roundedBranchArmPath(trunkX, parentRect.centerY, child.rect.centerY, child.rect.left)
+        });
+        nextEdges.push({
+          id: `${parent.id}:${child.node.id}:highlight`,
+          parentId: parent.id,
+          childId: child.node.id,
+          highlightOnly: true,
+          d: roundedHorizontalVerticalHorizontalPath(
+            parentRect.right,
+            parentRect.centerY,
+            trunkX,
+            child.rect.centerY,
+            child.rect.left
+          )
+        });
+      }
+    }
+
+    edgeLayerWidth = Math.ceil(Math.max(treeFrameElement.clientWidth, beamListElement.scrollWidth));
+    edgeLayerHeight = Math.ceil(Math.max(treeFrameElement.clientHeight, beamListElement.scrollHeight));
+    edgePaths = nextEdges;
+  }
+
   async function updateRenderTerminals() {
     if (!treeFrameElement) return;
 
@@ -552,6 +773,7 @@
     if (sameStringSet(renderTerminalNodeIds, nextTerminalNodeIds)) return;
 
     renderTerminalNodeIds = nextTerminalNodeIds;
+    scheduleEdgeMeasure();
     setTimeout(() => {
       void updateRenderTerminals();
     }, 0);
@@ -566,7 +788,7 @@
   }
 
   function generatedDepthForVisibleDepth(depth: number) {
-    return Math.min(48, depth + 8);
+    return maxGeneratedDepth;
   }
 
   function topRolloutNodes(): BeamNode[] {
@@ -662,6 +884,7 @@
       renderTerminalNodeIds = new Set();
       updateVisibleBeamShape();
       scheduleRenderPrune();
+      scheduleEdgeMeasure();
       void continueExploration();
     };
     const handleKeydown = (event: KeyboardEvent) => {
@@ -669,7 +892,7 @@
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       if (isTextEditingTarget(event.target)) return;
 
-      debugScrollMode = !debugScrollMode;
+      toggleDebugMode();
     };
     window.addEventListener('resize', handleResize);
     window.addEventListener('keydown', handleKeydown);
@@ -677,6 +900,7 @@
     return () => {
       explorationController?.abort();
       if (renderPruneTimer) clearTimeout(renderPruneTimer);
+      if (edgeMeasureFrame !== undefined) cancelAnimationFrame(edgeMeasureFrame);
       hideAlternativePopover();
       window.removeEventListener('resize', handleResize);
       window.removeEventListener('keydown', handleKeydown);
@@ -705,12 +929,12 @@
               {/each}
             </span>
           </button>
-          <small class:visible={detailMode === 'detailed'} class="token-prob">
-            {Math.round(node.prob * 1000) / 10}%
+          <small class:visible={debugScrollMode} class="token-prob">
+            {Math.round(node.prob * 1000) / 10}
           </small>
         </span>
       {:else}
-        <strong>{node.text || 'empty prompt'}</strong>
+        <span class="root-ellipsis">...</span>
       {/if}
     </div>
 
@@ -754,26 +978,6 @@
           </select>
         </label>
 
-        <div class="segmented" role="group" aria-label="Detail">
-          <button
-            class:active={detailMode === 'clean'}
-            type="button"
-            onclick={() => {
-              detailMode = 'clean';
-              hideAlternativePopover();
-            }}
-          >
-            Clean
-          </button>
-          <button
-            class:active={detailMode === 'detailed'}
-            type="button"
-            onclick={() => (detailMode = 'detailed')}
-          >
-            Detailed
-          </button>
-        </div>
-
         <button type="button" class="ghost" onclick={reset}>Reset</button>
       </div>
     </header>
@@ -799,34 +1003,71 @@
         class:debug-scroll={debugScrollMode}
         class="tree-frame"
         aria-label="Beam tree"
+        onscroll={scheduleEdgeMeasure}
       >
         {#if rootNode}
-          <ul class="beam-list">
+          {#if edgeLayerWidth > 0 && edgeLayerHeight > 0}
+            <svg
+              class="edge-layer"
+              aria-hidden="true"
+              width={edgeLayerWidth}
+              height={edgeLayerHeight}
+              viewBox={`0 0 ${edgeLayerWidth} ${edgeLayerHeight}`}
+            >
+              {#each edgePaths as edge (edge.id)}
+                <path
+                  class:highlight-only={edge.highlightOnly}
+                  class:highlighted={edge.highlightOnly &&
+                    edge.childId !== undefined &&
+                    highlightedNodeIds.has(edge.parentId) &&
+                    highlightedNodeIds.has(edge.childId)}
+                  class="edge-path"
+                  d={edge.d}
+                  pathLength="1"
+                />
+              {/each}
+            </svg>
+          {/if}
+          <ul bind:this={beamListElement} class="beam-list">
             {@render treeNode(rootNode)}
           </ul>
         {:else}
           <p>No beam loaded.</p>
         {/if}
-        <div class:active={debugScrollMode} class="debug-badge">[d]ebug</div>
       </section>
     </div>
   </section>
+  <button
+    class:active={debugScrollMode}
+    class="debug-badge"
+    type="button"
+    aria-pressed={debugScrollMode}
+    onclick={toggleDebugMode}
+  >
+    [d]ebug
+  </button>
 </main>
 
-{#if detailMode === 'detailed' && alternativePopoverNode && alternativePopoverAlternatives.length > 0}
+{#if alternativePopoverNode && alternativePopoverAlternatives.length > 0}
   <aside
     class="alternative-popover"
     style={`left: ${alternativePopoverX}px; top: ${alternativePopoverY}px;`}
     aria-label="Token alternatives"
     onmouseenter={keepAlternativePopover}
+    onmousemove={keepAlternativePopover}
+    onwheel={keepAlternativePopover}
+    onscroll={keepAlternativePopover}
     onmouseleave={handleAlternativePopoverLeave}
   >
     <ol class="alternative-row">
       {#each alternativePopoverAlternatives as alternative}
-        <li class:current={alternative.rank === alternativePopoverNode.rank}>
+        <li class:current={hoveredAlternativeRank === null && alternative.rank === alternativePopoverNode.rank}>
           <button
             type="button"
             class="alternative-option"
+            onmouseenter={() => handleAlternativeHover(alternative.rank)}
+            onmousemove={() => handleAlternativeHover(alternative.rank)}
+            onfocus={() => handleAlternativeHover(alternative.rank)}
             onclick={() => appendAlternative(alternativePopoverNode, alternative)}
           >
             <span class="alternative-token">
@@ -836,7 +1077,7 @@
                 {/each}
               </span>
             </span>
-            <small class="token-prob visible">{Math.round(alternative.prob * 1000) / 10}%</small>
+            <small class:visible={debugScrollMode} class="token-prob">{Math.round(alternative.prob * 1000) / 10}</small>
           </button>
         </li>
       {/each}
@@ -850,6 +1091,10 @@
   }
 
   :global(body) {
+    --tree-surface-background: #f7f9f7;
+    --token-background: #f7f9f7;
+    --token-highlight-background: #fff7df;
+
     margin: 0;
     min-width: 320px;
     color: #17211b;
@@ -926,31 +1171,11 @@
     padding: 0 10px;
   }
 
-  .segmented {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    height: 38px;
-    overflow: hidden;
-    border: 1px solid #bdc8c0;
-    border-radius: 8px;
-    background: #fbfcfb;
-  }
-
-  .segmented button,
   .ghost {
     border: 0;
     color: #425048;
     background: transparent;
     cursor: pointer;
-  }
-
-  .segmented button {
-    width: 70px;
-  }
-
-  .segmented button.active {
-    color: #ffffff;
-    background: #24553e;
   }
 
   .ghost {
@@ -1004,27 +1229,75 @@
     border: 1px solid #c6d0ca;
     border-radius: 8px;
     padding: 18px;
-    background: #f7f9f7;
+    background: var(--token-background);
   }
 
   .tree-frame.debug-scroll {
     overflow-x: auto;
   }
 
-  .debug-badge {
+  .edge-layer {
     position: absolute;
-    right: 10px;
-    bottom: 10px;
+    top: 0;
+    left: 0;
+    z-index: 0;
+    overflow: visible;
+    pointer-events: none;
+  }
+
+  .edge-path {
+    fill: none;
+    stroke: #cdd8d1;
+    stroke-width: 1;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    vector-effect: non-scaling-stroke;
+    animation: edge-draw 140ms ease-out both;
+  }
+
+  .edge-path.highlighted {
+    stroke: #d7be73;
+  }
+
+  .edge-path.highlight-only {
+    opacity: 0;
+    animation: none;
+  }
+
+  .edge-path.highlight-only.highlighted {
+    opacity: 1;
+  }
+
+  @keyframes edge-draw {
+    from {
+      opacity: 0;
+      stroke-dasharray: 1;
+      stroke-dashoffset: 1;
+    }
+
+    to {
+      opacity: 1;
+      stroke-dasharray: 1;
+      stroke-dashoffset: 0;
+    }
+  }
+
+  .debug-badge {
+    position: fixed;
+    right: 25px;
+    bottom: 2px;
     z-index: 10;
     width: max-content;
-    padding: 3px 7px;
+    height: 14px;
+    padding: 0 4px;
     border: 1px solid #c9cfcb;
-    border-radius: 6px;
+    border-radius: 4px;
     color: #7a837e;
     background: rgb(255 255 255 / 88%);
-    font-size: 11px;
+    font-size: 8px;
     font-weight: 700;
-    pointer-events: none;
+    line-height: 1;
+    cursor: pointer;
   }
 
   .debug-badge.active {
@@ -1041,6 +1314,8 @@
   }
 
   .beam-list {
+    position: relative;
+    z-index: 1;
     min-width: max-content;
   }
 
@@ -1048,7 +1323,7 @@
     position: relative;
     display: grid;
     grid-template-columns: max-content max-content;
-    column-gap: 4px;
+    column-gap: 2px;
     align-items: start;
     justify-items: start;
     margin: 0;
@@ -1057,8 +1332,8 @@
   .beam-list li > ul {
     display: flex;
     flex-direction: column;
-    gap: 4px;
-    padding-left: 4px;
+    gap: 2px;
+    padding-left: 2px;
   }
 
   .beam-list li.error > .tree-row {
@@ -1071,55 +1346,60 @@
     z-index: 1;
     display: inline-flex;
     align-items: center;
-    min-height: 34px;
+    min-height: 28px;
   }
 
   .tree-row.highlighted .token-button {
-    border-color: #b48b28;
-    background: #fff7df;
+    border-color: #e2d6b6;
+    background: var(--token-highlight-background);
     box-shadow: 0 0 0 2px rgb(180 139 40 / 16%);
   }
 
   .root > .tree-row {
-    padding: 5px 8px;
-    color: #ffffff;
-    border: 1px solid #24553e;
-    border-radius: 8px;
-    border-color: #24553e;
-    background: #24553e;
+    color: #87928c;
+    font-weight: 700;
   }
 
   .root > .tree-row.highlighted {
-    border-color: #b48b28;
-    background: #2f6a4f;
+    color: #57645d;
+  }
+
+  .root-ellipsis {
+    line-height: 1;
   }
 
   .node-stack {
-    display: grid;
-    justify-items: center;
-    gap: 2px;
+    position: relative;
+    display: inline-flex;
+    align-items: flex-start;
+    justify-content: center;
+    min-height: 39px;
   }
 
   .token-button {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    min-width: 48px;
-    min-height: 34px;
-    padding: 5px 3px;
-    border: 1px solid #aebbb4;
+    min-height: 28px;
+    padding: 1px 3px;
+    border: 1px solid #dce4df;
     border-radius: 6px;
     color: #14201a;
-    background: #ffffff;
+    background: var(--token-background);
     cursor: pointer;
     font-weight: 700;
   }
 
   .token-button:hover {
-    border-color: #24553e;
+    border-color: #c9d7d0;
   }
 
   .token-prob {
+    position: absolute;
+    top: 29px;
+    left: 50%;
+    width: max-content;
+    transform: translateX(-50%);
     color: #6b7c73;
     font-size: 8px;
     font-weight: 650;
@@ -1145,7 +1425,7 @@
     padding: 8px;
     border: 1px solid #b7c4bc;
     border-radius: 8px;
-    background: #ffffff;
+    background: var(--token-background);
     box-shadow: 0 10px 30px rgb(23 33 27 / 18%);
     color: #17211b;
   }
@@ -1154,7 +1434,7 @@
     display: flex;
     flex-direction: column;
     align-items: start;
-    gap: 4px;
+    gap: 2px;
     margin: 0;
     padding: 0;
     list-style: none;
@@ -1163,13 +1443,15 @@
   .alternative-row li {
     display: flex;
     align-items: start;
-    height: 44px;
+    height: 39px;
   }
 
   .alternative-option {
-    display: grid;
-    justify-items: center;
-    gap: 2px;
+    position: relative;
+    display: inline-flex;
+    align-items: flex-start;
+    justify-content: center;
+    min-height: 39px;
     padding: 0;
     border: 0;
     color: inherit;
@@ -1180,8 +1462,8 @@
   .alternative-row li.current .alternative-token,
   .alternative-option:hover .alternative-token,
   .alternative-option:focus-visible .alternative-token {
-    border-color: #b48b28;
-    background: #fff7df;
+    border-color: #e2d6b6;
+    background: var(--token-highlight-background);
     box-shadow: 0 0 0 2px rgb(180 139 40 / 14%);
   }
 
@@ -1189,13 +1471,12 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    min-width: 48px;
-    min-height: 34px;
-    padding: 5px 3px;
-    border: 1px solid #aebbb4;
+    min-height: 28px;
+    padding: 1px 3px;
+    border: 1px solid #dce4df;
     border-radius: 6px;
     color: #14201a;
-    background: #ffffff;
+    background: var(--token-background);
     font-weight: 700;
   }
 
