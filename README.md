@@ -1,6 +1,6 @@
 # TreeSage
 
-TreeSage is a local-first LLM beam-search typing tutor. This first milestone runs as a SvelteKit full-stack app with a deterministic fake provider and an Ollama provider for local model logprob data.
+TreeSage is a local-first LLM beam-search typing tutor. This first milestone runs as a SvelteKit full-stack app with Ollama for local model logprob data.
 
 ## Local Development
 
@@ -56,6 +56,5 @@ The Ollama provider uses `/api/generate`, not `/api/chat`, with `raw: true`,
 ### Logprob Caveat
 
 Ollama logprob availability can depend on the model and prompt length. At high
-token counts some models may return `200 OK` with an empty `response` and no
-`logprobs` field. Treat missing logprobs as "no distribution returned for this
-prompt/model position" and reduce the prompt length or switch models.
+token counts phi4 and maybe other models sometimes return `200 OK` with an empty `response` and no
+`logprobs` field.
