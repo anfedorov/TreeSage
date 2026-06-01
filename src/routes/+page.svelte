@@ -26,6 +26,12 @@
     bottom: number;
   };
 
+  type AlternativeRolloutPreview = {
+    status: 'loading' | 'ready' | 'error';
+    tokens: BeamTokenAlternative[];
+    error?: string;
+  };
+
   let text = $state('The model');
   let visibleDepth = $state(12);
   let generatedDepth = $state(20);
@@ -40,7 +46,10 @@
   let alternativePopoverX = $state(0);
   let alternativePopoverY = $state(0);
   let hoveredAlternativeRank = $state<number | null>(null);
+  let hoveredAlternativeTokenIndex = $state<number | null>(null);
   let alternativesByParentId = $state(new Map<string, BeamTokenAlternative[]>());
+  let alternativesByPromptKey = $state(new Map<string, BeamTokenAlternative[]>());
+  let alternativeRolloutsByKey = $state(new Map<string, AlternativeRolloutPreview>());
   let debugScrollMode = $state(false);
   let renderTerminalNodeIds = $state(new Set<string>());
   let edgePaths = $state<EdgePath[]>([]);
@@ -54,15 +63,21 @@
   let alternativePopoverShowTimer: ReturnType<typeof setTimeout> | undefined;
   let alternativePopoverHideTimer: ReturnType<typeof setTimeout> | undefined;
   let explorationController: AbortController | undefined;
+  let alternativeRolloutController: AbortController | undefined;
+  let pendingAlternativesByPromptKey = new Map<string, Promise<BeamTokenAlternative[]>>();
+  let beamVersion = 0;
   let explorationRunning = false;
   let explorationQueued = false;
   let fittingDepth = false;
 
   const modelTopK = 20;
   const maxClientNodes = 2000;
-  const alternativePopoverPadding = 8;
+  const alternativePopoverPadding = 18;
   const alternativePopoverBorder = 1;
   const alternativePopoverRowPitch = 41;
+  const alternativePopoverViewportMargin = 18;
+  const alternativeRolloutDepth = 24;
+  const alternativeRolloutConcurrency = 2;
   const nextTokenGap = 4;
   const minimumVisibleNextTokenWidth = 1;
   const treeRowPitch = 41;
@@ -88,6 +103,9 @@
     alternativePopoverNodeId ? nodesById.get(alternativePopoverNodeId) : undefined
   );
   const alternativePopoverAlternatives = $derived(alternativesForNode(alternativePopoverNode));
+  const alternativePopoverParent = $derived(
+    alternativePopoverNode?.parentId ? nodesById.get(alternativePopoverNode.parentId) : undefined
+  );
 
   function modelKey(model: ModelOption): string {
     return JSON.stringify([model.provider, model.id]);
@@ -156,12 +174,18 @@
 
   function loadBeam() {
     explorationController?.abort();
+    beamVersion += 1;
     const root = createRootNode(text);
     beam = {
       rootId: root.id,
       nodes: [root]
     };
     alternativesByParentId = new Map();
+    alternativesByPromptKey = new Map();
+    pendingAlternativesByPromptKey = new Map();
+    alternativeRolloutsByKey = new Map();
+    alternativeRolloutController?.abort();
+    alternativeRolloutController = undefined;
     renderTerminalNodeIds = new Set();
     edgePaths = [];
     statusMessage = '';
@@ -191,31 +215,129 @@
     alternativePopoverHideTimer = undefined;
   }
 
-  async function getAlternatives(parent: BeamNode, signal: AbortSignal): Promise<BeamTokenAlternative[]> {
-    const cached = alternativesByParentId.get(parent.id);
+  function promptCacheKey(
+    promptText: string,
+    provider: ProviderId = selectedProvider,
+    model: string = selectedModel
+  ): string {
+    return JSON.stringify([provider, model, promptText]);
+  }
+
+  function tokenAlternativeFromNode(node: BeamNode): BeamTokenAlternative {
+    return {
+      text: node.text,
+      logprob: node.logprob,
+      rank: node.rank,
+      prob: node.prob
+    };
+  }
+
+  function cacheAlternativesForPrompt(
+    cacheKey: string,
+    promptText: string,
+    alternatives: BeamTokenAlternative[],
+    requestBeamVersion: number
+  ) {
+    alternativesByPromptKey = new Map(alternativesByPromptKey).set(cacheKey, alternatives);
+
+    if (requestBeamVersion !== beamVersion) return;
+
+    const matchingNode = currentNodes.find((node) => pathPrefix(node) === promptText);
+    if (matchingNode && !alternativesByParentId.has(matchingNode.id)) {
+      alternativesByParentId = new Map(alternativesByParentId).set(matchingNode.id, alternatives);
+    }
+  }
+
+  function abortError(): DOMException {
+    return new DOMException('The operation was aborted.', 'AbortError');
+  }
+
+  function isAbortError(error: unknown): boolean {
+    return error instanceof DOMException && error.name === 'AbortError';
+  }
+
+  function withConsumerAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+    if (signal.aborted) return Promise.reject(abortError());
+
+    return new Promise((resolve, reject) => {
+      const cleanup = () => signal.removeEventListener('abort', onAbort);
+      const onAbort = () => {
+        cleanup();
+        reject(abortError());
+      };
+
+      signal.addEventListener('abort', onAbort, { once: true });
+      promise.then(
+        (value) => {
+          cleanup();
+          if (signal.aborted) {
+            reject(abortError());
+          } else {
+            resolve(value);
+          }
+        },
+        (error) => {
+          cleanup();
+          reject(error);
+        }
+      );
+    });
+  }
+
+  async function requestAlternativesForText(
+    promptText: string,
+    signal: AbortSignal
+  ): Promise<BeamTokenAlternative[]> {
+    const provider = selectedProvider;
+    const model = selectedModel;
+    const requestBeamVersion = beamVersion;
+    const cacheKey = promptCacheKey(promptText, provider, model);
+    const cached = alternativesByPromptKey.get(cacheKey);
     if (cached) return cached;
 
-    const response = await fetch('/api/next-token', {
+    const pending = pendingAlternativesByPromptKey.get(cacheKey);
+    if (pending) return withConsumerAbort(pending, signal);
+
+    let request: Promise<BeamTokenAlternative[]>;
+    request = fetch('/api/next-token', {
       method: 'POST',
-      signal,
       headers: {
         'content-type': 'application/json'
       },
       body: JSON.stringify({
-        provider: selectedProvider,
-        model: selectedModel,
-        text: pathPrefix(parent),
+        provider,
+        model,
+        text: promptText,
         topK: modelTopK
       })
-    });
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error(`Next-token request failed with ${response.status}`);
+        }
 
-    if (!response.ok) {
-      throw new Error(`Next-token request failed with ${response.status}`);
-    }
+        const payload = (await response.json()) as NextTokenResponse;
+        cacheAlternativesForPrompt(cacheKey, promptText, payload.alternatives, requestBeamVersion);
+        return payload.alternatives;
+      })
+      .finally(() => {
+        if (pendingAlternativesByPromptKey.get(cacheKey) === request) {
+          pendingAlternativesByPromptKey.delete(cacheKey);
+        }
+      });
 
-    const payload = (await response.json()) as NextTokenResponse;
-    alternativesByParentId = new Map(alternativesByParentId).set(parent.id, payload.alternatives);
-    return payload.alternatives;
+    pendingAlternativesByPromptKey.set(cacheKey, request);
+    return withConsumerAbort(request, signal);
+  }
+
+  async function getAlternatives(parent: BeamNode, signal: AbortSignal): Promise<BeamTokenAlternative[]> {
+    const cached = alternativesByParentId.get(parent.id);
+    if (cached) return cached;
+
+    const promptText = pathPrefix(parent);
+    const alternatives = await requestAlternativesForText(promptText, signal);
+    alternativesByParentId = new Map(alternativesByParentId).set(parent.id, alternatives);
+    return alternatives;
   }
 
   function pathPrefix(node: BeamNode): string {
@@ -461,8 +583,164 @@
     scheduleBeamRefresh(0);
   }
 
+  function isPopoverTokenHighlighted(alternative: BeamTokenAlternative, tokenIndex: number): boolean {
+    if (hoveredAlternativeRank === null) {
+      return alternative.rank === alternativePopoverNode?.rank && tokenIndex === 0;
+    }
+
+    if (hoveredAlternativeRank !== alternative.rank || hoveredAlternativeTokenIndex === null) {
+      return false;
+    }
+
+    return tokenIndex <= hoveredAlternativeTokenIndex;
+  }
+
+  function alternativeRolloutKey(parent: BeamNode, alternative: BeamTokenAlternative): string {
+    return JSON.stringify([selectedProvider, selectedModel, parent.id, alternative.rank]);
+  }
+
+  function childForAlternative(
+    parent: BeamNode,
+    alternative: BeamTokenAlternative
+  ): BeamNode | undefined {
+    return parent.children
+      .map((childId) => nodesById.get(childId))
+      .find((child) => child?.rank === alternative.rank && child.text === alternative.text);
+  }
+
+  function greedyRolloutFromTree(
+    parent: BeamNode,
+    alternative: BeamTokenAlternative
+  ): BeamTokenAlternative[] {
+    const tokens: BeamTokenAlternative[] = [];
+    let cursor = childForAlternative(parent, alternative);
+
+    while (cursor && tokens.length < alternativeRolloutDepth) {
+      const next = cursor.children
+        .map((childId) => nodesById.get(childId))
+        .find((child) => child?.rank === 1);
+      if (!next) break;
+
+      tokens.push(tokenAlternativeFromNode(next));
+      cursor = next;
+    }
+
+    return tokens;
+  }
+
+  function longerTokenList(
+    left: BeamTokenAlternative[],
+    right: BeamTokenAlternative[]
+  ): BeamTokenAlternative[] {
+    return left.length >= right.length ? left : right;
+  }
+
+  function alternativeRolloutFor(
+    parent: BeamNode | undefined,
+    alternative: BeamTokenAlternative
+  ): AlternativeRolloutPreview | undefined {
+    return parent ? alternativeRolloutsByKey.get(alternativeRolloutKey(parent, alternative)) : undefined;
+  }
+
+  function updateAlternativeRollout(
+    key: string,
+    preview: AlternativeRolloutPreview
+  ) {
+    alternativeRolloutsByKey = new Map(alternativeRolloutsByKey).set(key, preview);
+  }
+
+  async function rollOutAlternative(
+    parent: BeamNode,
+    alternative: BeamTokenAlternative,
+    signal: AbortSignal
+  ) {
+    const key = alternativeRolloutKey(parent, alternative);
+    const cachedPreview = alternativeRolloutsByKey.get(key);
+    const treeTokens = greedyRolloutFromTree(parent, alternative);
+    const tokens = [
+      ...longerTokenList(cachedPreview?.tokens ?? [], treeTokens).slice(0, alternativeRolloutDepth)
+    ];
+
+    if (cachedPreview?.status === 'ready' && cachedPreview.tokens.length >= treeTokens.length) {
+      return;
+    }
+
+    if (treeTokens.length > 0 && treeTokens.length >= (cachedPreview?.tokens.length ?? 0)) {
+      updateAlternativeRollout(key, { status: 'loading', tokens: [...tokens] });
+    }
+
+    try {
+      let prompt = `${pathPrefix(parent)}${alternative.text}${tokens.map((token) => token.text).join('')}`;
+      updateAlternativeRollout(key, { status: 'loading', tokens: [...tokens] });
+
+      for (let depth = tokens.length; depth < alternativeRolloutDepth && !signal.aborted; depth += 1) {
+        const nextAlternatives = await requestAlternativesForText(prompt, signal);
+        const next = nextAlternatives[0];
+        if (!next) break;
+
+        tokens.push(next);
+        prompt = `${prompt}${next.text}`;
+        updateAlternativeRollout(key, { status: 'loading', tokens: [...tokens] });
+        await tick();
+      }
+
+      if (!signal.aborted) {
+        updateAlternativeRollout(key, { status: 'ready', tokens: [...tokens] });
+      }
+    } catch (error) {
+      if (signal.aborted || isAbortError(error)) return;
+      updateAlternativeRollout(key, {
+        status: 'error',
+        tokens: [...tokens],
+        error: error instanceof Error ? error.message : 'Could not roll out alternative.'
+      });
+    }
+  }
+
+  async function startAlternativeRollouts(node: BeamNode) {
+    const parent = node.parentId ? nodesById.get(node.parentId) : undefined;
+    if (!parent) return;
+
+    const alternatives = alternativesForNode(node);
+    if (alternatives.length === 0) return;
+
+    alternativeRolloutController?.abort();
+    alternativeRolloutController = new AbortController();
+    const signal = alternativeRolloutController.signal;
+    let nextIndex = 0;
+
+    const runWorker = async () => {
+      while (!signal.aborted && nextIndex < alternatives.length) {
+        const alternative = alternatives[nextIndex];
+        nextIndex += 1;
+        await rollOutAlternative(parent, alternative, signal);
+      }
+    };
+
+    try {
+      await Promise.all(
+        Array.from(
+          { length: Math.min(alternativeRolloutConcurrency, alternatives.length) },
+          () => runWorker()
+        )
+      );
+    } catch (error) {
+      if (!signal.aborted && !isAbortError(error)) {
+        throw error;
+      }
+    }
+  }
+
   function highlightNode(node: BeamNode) {
     if (node.parentId) hoveredNodeId = node.id;
+  }
+
+  function closeAlternativePopover() {
+    alternativePopoverNodeId = null;
+    hoveredAlternativeRank = null;
+    hoveredAlternativeTokenIndex = null;
+    alternativeRolloutController?.abort();
+    alternativeRolloutController = undefined;
   }
 
   function hideAlternativePopover() {
@@ -470,8 +748,7 @@
     if (alternativePopoverHideTimer) clearTimeout(alternativePopoverHideTimer);
     alternativePopoverShowTimer = undefined;
     alternativePopoverHideTimer = undefined;
-    alternativePopoverNodeId = null;
-    hoveredAlternativeRank = null;
+    closeAlternativePopover();
   }
 
   function handleNodeHoverStart(node: BeamNode, event: MouseEvent) {
@@ -482,6 +759,7 @@
     alternativePopoverHideTimer = undefined;
     alternativePopoverNodeId = null;
     hoveredAlternativeRank = null;
+    hoveredAlternativeTokenIndex = null;
 
     if (!node.parentId) return;
 
@@ -502,6 +780,7 @@
     alternativePopoverShowTimer = setTimeout(() => {
       alternativePopoverNodeId = node.id;
       alternativePopoverShowTimer = undefined;
+      void startAlternativeRollouts(node);
     }, 1000);
   }
 
@@ -515,7 +794,7 @@
   function scheduleAlternativePopoverHide() {
     if (alternativePopoverHideTimer) clearTimeout(alternativePopoverHideTimer);
     alternativePopoverHideTimer = setTimeout(() => {
-      alternativePopoverNodeId = null;
+      closeAlternativePopover();
       alternativePopoverHideTimer = undefined;
     }, 220);
   }
@@ -526,13 +805,26 @@
     hoveredNodeId = null;
   }
 
-  function handleAlternativeHover(rank: number) {
+  function handleAlternativeHover(rank: number, tokenIndex: number) {
     keepAlternativePopover();
     hoveredAlternativeRank = rank;
+    hoveredAlternativeTokenIndex = tokenIndex;
+  }
+
+  function handleAlternativePointerMove(rank: number, event: MouseEvent) {
+    keepAlternativePopover();
+    if (!(event.target instanceof HTMLElement)) return;
+
+    const tokenElement = event.target.closest<HTMLElement>('.alternative-token-stack[data-token-index]');
+    const tokenIndex = tokenElement?.dataset.tokenIndex
+      ? Number.parseInt(tokenElement.dataset.tokenIndex, 10)
+      : 0;
+    handleAlternativeHover(rank, Number.isFinite(tokenIndex) ? tokenIndex : 0);
   }
 
   function handleAlternativePopoverLeave() {
     hoveredAlternativeRank = null;
+    hoveredAlternativeTokenIndex = null;
     scheduleAlternativePopoverHide();
   }
 
@@ -1051,7 +1343,7 @@
 {#if alternativePopoverNode && alternativePopoverAlternatives.length > 0}
   <aside
     class="alternative-popover"
-    style={`left: ${alternativePopoverX}px; top: ${alternativePopoverY}px;`}
+    style={`left: ${alternativePopoverX}px; top: ${alternativePopoverY}px; right: ${alternativePopoverViewportMargin}px; bottom: ${alternativePopoverViewportMargin}px;`}
     aria-label="Token alternatives"
     onmouseenter={keepAlternativePopover}
     onmousemove={keepAlternativePopover}
@@ -1065,19 +1357,49 @@
           <button
             type="button"
             class="alternative-option"
-            onmouseenter={() => handleAlternativeHover(alternative.rank)}
-            onmousemove={() => handleAlternativeHover(alternative.rank)}
-            onfocus={() => handleAlternativeHover(alternative.rank)}
+            onmouseenter={() => handleAlternativeHover(alternative.rank, 0)}
+            onmousemove={(event) => handleAlternativePointerMove(alternative.rank, event)}
+            onfocus={() => handleAlternativeHover(alternative.rank, 0)}
             onclick={() => appendAlternative(alternativePopoverNode, alternative)}
           >
-            <span class="alternative-token">
-              <span class="token-text">
-                {#each displayTokenParts(alternative.text) as part}
-                  <span class:control-char={part.control}>{part.text}</span>
-                {/each}
+            <span class="alternative-token-stack" data-token-index="0">
+              <span
+                class:popover-highlighted={isPopoverTokenHighlighted(alternative, 0)}
+                class="alternative-token"
+              >
+                <span class="token-text">
+                  {#each displayTokenParts(alternative.text) as part}
+                    <span class:control-char={part.control}>{part.text}</span>
+                  {/each}
+                </span>
               </span>
+              <small class:visible={debugScrollMode} class="token-prob">{Math.round(alternative.prob * 1000) / 10}</small>
             </span>
-            <small class:visible={debugScrollMode} class="token-prob">{Math.round(alternative.prob * 1000) / 10}</small>
+            {#if alternativePopoverParent}
+              {@const rollout = alternativeRolloutFor(alternativePopoverParent, alternative)}
+              <span class="alternative-rollout" aria-hidden="true">
+                {#each rollout?.tokens ?? [] as rolloutToken, index}
+                  <span class="alternative-token-stack" data-token-index={index + 1}>
+                    <span
+                      class:popover-highlighted={isPopoverTokenHighlighted(alternative, index + 1)}
+                      class="alternative-token rollout-token"
+                    >
+                      <span class="token-text">
+                        {#each displayTokenParts(rolloutToken.text) as part}
+                          <span class:control-char={part.control}>{part.text}</span>
+                        {/each}
+                      </span>
+                    </span>
+                    <small class:visible={debugScrollMode} class="token-prob">{Math.round(rolloutToken.prob * 1000) / 10}</small>
+                  </span>
+                {/each}
+                {#if rollout?.status === 'loading'}
+                  <span class="rollout-loading">...</span>
+                {:else if rollout?.status === 'error'}
+                  <span class="rollout-error">!</span>
+                {/if}
+              </span>
+            {/if}
           </button>
         </li>
       {/each}
@@ -1418,12 +1740,12 @@
   .alternative-popover {
     position: fixed;
     z-index: 20;
-    width: max-content;
-    max-width: min(320px, calc(100vw - 24px));
-    max-height: min(520px, calc(100vh - 24px));
+    width: auto;
+    max-width: none;
+    max-height: none;
     overflow: auto;
-    padding: 8px;
-    border: 1px solid #b7c4bc;
+    padding: 18px;
+    border: 1px solid #c6d0ca;
     border-radius: 8px;
     background: var(--token-background);
     box-shadow: 0 10px 30px rgb(23 33 27 / 18%);
@@ -1438,11 +1760,13 @@
     margin: 0;
     padding: 0;
     list-style: none;
+    min-width: 100%;
   }
 
   .alternative-row li {
     display: flex;
     align-items: start;
+    width: 100%;
     height: 39px;
   }
 
@@ -1450,7 +1774,10 @@
     position: relative;
     display: inline-flex;
     align-items: flex-start;
-    justify-content: center;
+    justify-content: flex-start;
+    gap: 2px;
+    width: 100%;
+    min-width: 0;
     min-height: 39px;
     padding: 0;
     border: 0;
@@ -1459,16 +1786,25 @@
     cursor: pointer;
   }
 
-  .alternative-row li.current .alternative-token,
-  .alternative-option:hover .alternative-token,
-  .alternative-option:focus-visible .alternative-token {
+  .alternative-token.popover-highlighted,
+  .alternative-option:focus-visible > .alternative-token-stack > .alternative-token {
     border-color: #e2d6b6;
     background: var(--token-highlight-background);
     box-shadow: 0 0 0 2px rgb(180 139 40 / 14%);
   }
 
+  .alternative-token-stack {
+    position: relative;
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: flex-start;
+    justify-content: center;
+    min-height: 39px;
+  }
+
   .alternative-token {
     display: inline-flex;
+    flex: 0 0 auto;
     align-items: center;
     justify-content: center;
     min-height: 28px;
@@ -1478,6 +1814,30 @@
     color: #14201a;
     background: var(--token-background);
     font-weight: 700;
+  }
+
+  .alternative-rollout {
+    display: inline-flex;
+    align-items: flex-start;
+    gap: 2px;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .rollout-loading,
+  .rollout-error {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    min-height: 28px;
+    color: #8c9891;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1;
+  }
+
+  .rollout-error {
+    color: #9d5148;
   }
 
   @media (max-width: 860px) {

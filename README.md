@@ -55,6 +55,5 @@ The Ollama provider uses `/api/generate`, not `/api/chat`, with `raw: true`,
 
 ### Logprob Caveat
 
-Ollama logprob availability can depend on the model and prompt length. At high
-token counts phi4 and maybe other models sometimes return `200 OK` with an empty `response` and no
-`logprobs` field.
+Ollama can struggle to return logprobs for long prompts with `phi4` and some
+other models.
