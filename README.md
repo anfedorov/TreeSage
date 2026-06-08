@@ -17,7 +17,7 @@ carve up the same prompt.
 ## Model Examples
 
 The same prompt can reveal very different next-token landscapes across local
-models.
+models. These examples show local models completing the prompt `"The model..."`.
 
 | llama3.2:3b | qwen2.5:7b |
 | --- | --- |
