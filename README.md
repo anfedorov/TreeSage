@@ -1,14 +1,18 @@
 # TreeSage
 
-TreeSage is a local-first LLM beam-search typing tutor. This first milestone runs as a SvelteKit full-stack app with Ollama for local model logprob data.
+TreeSage is a local-first experiment in LLM interaction design: an interface
+for exploring the semantic search space implied by next-token distributions. It
+runs as a SvelteKit full-stack app with Ollama for local model logprob data.
 
 ## Goal
 
-TreeSage's goal is to remove implicit stochasticity from the way we interact
-with LLMs. Instead of sampling one completion and treating it as "the" answer,
-TreeSage lets a user traverse the next-token selection tree directly. The
-interface is designed to make those branches intuitive to explore while exposing
-the language semantics encoded in the model's weights.
+Most LLM interfaces collapse a probabilistic policy into a single sampled
+string. TreeSage makes that policy surface navigable. Given a prompt, it lays
+out likely continuations as a branching next-token tree, letting a user inspect
+and choose paths rather than accept implicit temperature-driven randomness. The
+result is a visual tool for exploring the linguistic semantics encoded in model
+weights: where models agree, where they branch, and how different local models
+carve up the same prompt.
 
 ## Model Examples
 

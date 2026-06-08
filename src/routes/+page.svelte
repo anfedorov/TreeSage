@@ -1244,7 +1244,7 @@
   <title>TreeSage</title>
   <meta
     name="description"
-    content="A local-first LLM beam search typing tutor and visualization."
+    content="A local-first LLM interaction experiment for exploring next-token semantic trees."
   />
 </svelte:head>
 
@@ -1253,7 +1253,7 @@
     <header class="topbar">
       <div>
         <h1>TreeSage</h1>
-        <p>Local beam-search typing tutor</p>
+        <p>Next-token semantics explorer</p>
       </div>
 
       <div class="controls" aria-label="Beam controls">
